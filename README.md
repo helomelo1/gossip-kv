@@ -1,4 +1,4 @@
-# p2p-gossip-network
+# gossip-kv
 
 A peer-to-peer distributed key-value store built in C++ that uses a gossip protocol for data replication and speaks the Redis wire protocol (RESP), so standard `redis-cli` works out of the box.
 
