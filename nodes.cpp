@@ -27,6 +27,7 @@ int node_port;
 
 // --- Dedup state ---
 unordered_set<string> seen_messages;
+queue<string> seen_order;
 mutex seen_mutex;
 atomic<uint64_t> msg_counter{0};
 
@@ -44,10 +45,30 @@ string generate_msg_id() {
 bool mark_seen(const string& id) {
     lock_guard<mutex> lock(seen_mutex);
     if (seen_messages.count(id)) return false;
-    // Evict oldest entries if set is too large
-    if (seen_messages.size() >= MAX_SEEN) seen_messages.clear();
+    // FIFO eviction: remove oldest entries when set is full
+    while (seen_messages.size() >= MAX_SEEN) {
+        seen_messages.erase(seen_order.front());
+        seen_order.pop();
+    }
     seen_messages.insert(id);
+    seen_order.push(id);
     return true;
+}
+
+// Encode a KV_PUT for gossip: KV_PUT:<keylen>:<key><value>
+// Length-prefixed so values containing ':' are handled correctly
+string encode_kv_put(const string& key, const string& val) {
+    return "KV_PUT:" + to_string(key.size()) + ":" + key + val;
+}
+
+// Decode a KV_PUT payload: returns {key, value}
+pair<string, string> decode_kv_put(const string& content) {
+    // content = "<keylen>:<key><value>"
+    size_t colon = content.find(':');
+    int keylen = stoi(content.substr(0, colon));
+    string key = content.substr(colon + 1, keylen);
+    string val = content.substr(colon + 1 + keylen);
+    return {key, val};
 }
 
 void add_or_update_peer(const string& ip, int port) {
@@ -125,15 +146,11 @@ void handle_peer_msg(int fd, sockaddr_in peer_addr) {
 
             // Apply KV operations carried via gossip
             if (content.size() > 7 && content.substr(0, 7) == "KV_PUT:") {
-                // Format: KV_PUT:<key>:<value>
-                size_t sep = content.find(':', 7);
-                if (sep != string::npos) {
-                    string key = content.substr(7, sep - 7);
-                    string val = content.substr(sep + 1);
-                    lock_guard<mutex> lock(kv_mutex);
-                    kv_store[key] = val;
-                    cout << "[KV] Replicated PUT " << key << " = " << val << "\n";
-                }
+                // Format: KV_PUT:<keylen>:<key><value>
+                auto [key, val] = decode_kv_put(content.substr(7));
+                lock_guard<mutex> lock(kv_mutex);
+                kv_store[key] = val;
+                cout << "[KV] Replicated PUT " << key << " = " << val << "\n";
             } else if (content.size() > 7 && content.substr(0, 7) == "KV_DEL:") {
                 // Format: KV_DEL:<key>
                 string key = content.substr(7);
@@ -205,7 +222,7 @@ void handle_client(int fd, sockaddr_in addr) {
                     kv_store[key] = val;
                 }
                 // Gossip the KV update to peers
-                gossip_spread("KV_PUT:" + key + ":" + val, 3);
+                gossip_spread(encode_kv_put(key, val), 3);
                 resp = "OK (" + key + " = " + val + ")\n> ";
             }
 
@@ -424,7 +441,7 @@ void handle_resp_client(int fd) {
                     lock_guard<mutex> lock(kv_mutex);
                     kv_store[args[1]] = args[2];
                 }
-                gossip_spread("KV_PUT:" + args[1] + ":" + args[2], 3);
+                gossip_spread(encode_kv_put(args[1], args[2]), 3);
                 reply = resp_ok();
             }
 
@@ -491,7 +508,7 @@ void handle_resp_client(int fd) {
                         lock_guard<mutex> lock(kv_mutex);
                         kv_store[args[i]] = args[i + 1];
                     }
-                    gossip_spread("KV_PUT:" + args[i] + ":" + args[i + 1], 3);
+                    gossip_spread(encode_kv_put(args[i], args[i + 1]), 3);
                 }
                 reply = resp_ok();
             }
@@ -511,9 +528,14 @@ void handle_resp_client(int fd) {
         } else if (cmd == "APPEND") {
             if (args.size() < 3) { reply = resp_error("wrong number of arguments for 'append'"); }
             else {
-                lock_guard<mutex> lock(kv_mutex);
-                kv_store[args[1]] += args[2];
-                reply = resp_integer(kv_store[args[1]].size());
+                string new_val;
+                {
+                    lock_guard<mutex> lock(kv_mutex);
+                    kv_store[args[1]] += args[2];
+                    new_val = kv_store[args[1]];
+                }
+                gossip_spread(encode_kv_put(args[1], new_val), 3);
+                reply = resp_integer(new_val.size());
             }
 
         } else if (cmd == "STRLEN") {
@@ -536,6 +558,8 @@ void handle_resp_client(int fd) {
                 }
                 val += (cmd == "INCR") ? 1 : -1;
                 kv_store[args[1]] = to_string(val);
+                // Gossip the new value (release lock first via scope below)
+                gossip_spread(encode_kv_put(args[1], to_string(val)), 3);
                 reply = resp_integer(val);
             }
 

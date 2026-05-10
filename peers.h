@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <atomic>
+#include <queue>
 
 using namespace std;
 
@@ -22,6 +23,7 @@ extern int node_port;
 
 // --- Dedup ---
 extern unordered_set<string> seen_messages;
+extern queue<string> seen_order;  // FIFO eviction queue
 extern mutex seen_mutex;
 extern atomic<uint64_t> msg_counter;
 string generate_msg_id();
